@@ -450,6 +450,68 @@ func normalizeChatCompletionsRequest(req map[string]any) (map[string]any, error)
 			}
 			continue
 		}
+		if role == "assistant" {
+			if toolCallsRaw, ok := msg["tool_calls"].([]any); ok && len(toolCallsRaw) > 0 {
+				for i, tcRaw := range toolCallsRaw {
+					tc, ok := tcRaw.(map[string]any)
+					if !ok {
+						continue
+					}
+					tcType, _ := tc["type"].(string)
+					if tcType != "" && tcType != "function" {
+						continue
+					}
+					callID, _ := tc["id"].(string)
+					if strings.TrimSpace(callID) == "" {
+						callID = fmt.Sprintf("call_%d", i)
+					}
+
+					fn, _ := tc["function"].(map[string]any)
+					if fn == nil {
+						continue
+					}
+					name, _ := fn["name"].(string)
+					if strings.TrimSpace(name) == "" {
+						continue
+					}
+
+					arguments := ""
+					switch v := fn["arguments"].(type) {
+					case string:
+						arguments = v
+					case nil:
+						arguments = ""
+					default:
+						// Keep compatibility with clients that send parsed objects instead of JSON string.
+						if b, err := json.Marshal(v); err == nil {
+							arguments = string(b)
+						}
+					}
+
+					inputItems = append(inputItems, map[string]any{
+						"type":      "function_call",
+						"call_id":   callID,
+						"name":      name,
+						"arguments": arguments,
+					})
+				}
+				// Some clients send assistant text + tool_calls in the same message.
+				// Preserve text as a normal assistant message so downstream context stays intact.
+				if strings.TrimSpace(content) != "" {
+					inputItems = append(inputItems, map[string]any{
+						"type": "message",
+						"role": role,
+						"content": []map[string]any{
+							{
+								"type": "input_text",
+								"text": content,
+							},
+						},
+					})
+				}
+				continue
+			}
+		}
 		if role == "tool" {
 			item := map[string]any{
 				"type":   "function_call_output",
