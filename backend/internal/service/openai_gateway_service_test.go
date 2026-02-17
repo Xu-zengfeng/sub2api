@@ -881,6 +881,49 @@ func TestOpenAIStreamingTimeoutDisabledForChatCompat(t *testing.T) {
 	}
 }
 
+func TestOpenAIStreamingChatCompatSynthesizesDoneOnEOF(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	cfg := &config.Config{
+		Gateway: config.GatewayConfig{
+			StreamDataIntervalTimeout: 0,
+			StreamKeepaliveInterval:   0,
+			MaxLineSize:               defaultMaxLineSize,
+		},
+	}
+	svc := &OpenAIGatewayService{cfg: cfg}
+
+	rec := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(rec)
+	c.Request = httptest.NewRequest(http.MethodPost, "/v1/chat/completions", nil)
+	c.Set(CtxKeyOpenAIChatCompletionsCompat, true)
+
+	pr, pw := io.Pipe()
+	resp := &http.Response{
+		StatusCode: http.StatusOK,
+		Body:       pr,
+		Header:     http.Header{},
+	}
+
+	go func() {
+		defer func() { _ = pw.Close() }()
+		_, _ = pw.Write([]byte("data: {\"type\":\"response.output_text.delta\",\"delta\":\"hello\"}\n\n"))
+		// Intentionally no response.done/response.completed.
+	}()
+
+	_, err := svc.handleStreamingResponse(c.Request.Context(), resp, c, &Account{ID: 8}, time.Now(), "model", "model")
+	_ = pr.Close()
+	if err != nil {
+		t.Fatalf("expected nil error, got %v", err)
+	}
+	body := rec.Body.String()
+	if !strings.Contains(body, "\"chat.completion.chunk\"") {
+		t.Fatalf("expected chat chunks, got %q", body)
+	}
+	if !strings.Contains(body, "data: [DONE]") {
+		t.Fatalf("expected synthesized DONE marker, got %q", body)
+	}
+}
+
 func TestOpenAIStreamingContextCanceledDoesNotInjectErrorEvent(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	cfg := &config.Config{

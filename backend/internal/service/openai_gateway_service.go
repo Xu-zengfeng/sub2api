@@ -1358,6 +1358,21 @@ func (s *OpenAIGatewayService) handleStreamingResponse(ctx context.Context, resp
 		select {
 		case ev, ok := <-events:
 			if !ok {
+				if isChatCompat && !chatDoneSent && !clientDisconnected {
+					chatDoneSent = true
+					reason := "stop"
+					if chatToolState != nil && chatToolState.nextIndex > 0 {
+						reason = "tool_calls"
+					}
+					if chunk := buildChatChunk(originalModel, chatChunkID, chatCreated, map[string]any{}, &reason); chunk != "" {
+						if _, err := fmt.Fprintf(w, "data: %s\n\n", chunk); err == nil {
+							flusher.Flush()
+						}
+					}
+					if _, err := fmt.Fprint(w, "data: [DONE]\n\n"); err == nil {
+						flusher.Flush()
+					}
+				}
 				return &openaiStreamingResult{usage: usage, firstTokenMs: firstTokenMs}, nil
 			}
 			if ev.err != nil {
