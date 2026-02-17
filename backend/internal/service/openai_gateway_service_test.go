@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"io"
 	"net/http"
@@ -835,6 +836,116 @@ func TestOpenAIStreamingTimeout(t *testing.T) {
 	}
 	if !strings.Contains(rec.Body.String(), "\"type\":\"error\"") || !strings.Contains(rec.Body.String(), "stream_timeout") {
 		t.Fatalf("expected OpenAI-compatible error SSE event, got %q", rec.Body.String())
+	}
+}
+
+func TestConvertResponsesSSEToChatChunks_FunctionCallArgumentsDone(t *testing.T) {
+	roleSent := false
+	toolState := newChatToolCallState()
+
+	added := `{"type":"response.output_item.added","output_index":0,"item":{"id":"item_1","type":"function_call","call_id":"call_1","name":"edit"}}`
+	chunks, done := convertResponsesSSEToChatChunks(added, "gpt-5.3-codex", "chatcmpl-1", 123, &roleSent, toolState)
+	if done {
+		t.Fatalf("expected done=false for output_item.added")
+	}
+	if len(chunks) != 0 {
+		t.Fatalf("expected no chunk for output_item.added, got %d", len(chunks))
+	}
+
+	argsDone := `{"type":"response.function_call_arguments.done","item_id":"item_1","output_index":0,"arguments":"{\"filePath\":\"main.go\",\"oldString\":\"a\",\"newString\":\"b\"}"}`
+	chunks, done = convertResponsesSSEToChatChunks(argsDone, "gpt-5.3-codex", "chatcmpl-1", 123, &roleSent, toolState)
+	if done {
+		t.Fatalf("expected done=false for function_call_arguments.done")
+	}
+	if len(chunks) != 2 {
+		t.Fatalf("expected role+tool chunks, got %d", len(chunks))
+	}
+
+	if !strings.Contains(chunks[0], `"role":"assistant"`) {
+		t.Fatalf("expected first chunk to set assistant role, got %s", chunks[0])
+	}
+
+	var toolChunk struct {
+		Choices []struct {
+			Delta struct {
+				ToolCalls []struct {
+					ID       string `json:"id"`
+					Function struct {
+						Name      string `json:"name"`
+						Arguments string `json:"arguments"`
+					} `json:"function"`
+				} `json:"tool_calls"`
+			} `json:"delta"`
+		} `json:"choices"`
+	}
+	if err := json.Unmarshal([]byte(chunks[1]), &toolChunk); err != nil {
+		t.Fatalf("failed to parse tool chunk: %v", err)
+	}
+	if len(toolChunk.Choices) == 0 || len(toolChunk.Choices[0].Delta.ToolCalls) == 0 {
+		t.Fatalf("expected tool_calls in second chunk: %s", chunks[1])
+	}
+	call := toolChunk.Choices[0].Delta.ToolCalls[0]
+	if call.ID != "call_1" {
+		t.Fatalf("expected call id call_1, got %s", call.ID)
+	}
+	if call.Function.Name != "edit" {
+		t.Fatalf("expected function name edit, got %s", call.Function.Name)
+	}
+	if !strings.Contains(call.Function.Arguments, `"filePath":"main.go"`) {
+		t.Fatalf("unexpected arguments: %s", call.Function.Arguments)
+	}
+}
+
+func TestConvertResponsesJSONToChatCompletion_CustomToolCallInputFallback(t *testing.T) {
+	body := []byte(`{
+		"id":"resp_1",
+		"model":"gpt-5.3-codex",
+		"output":[
+			{
+				"type":"custom_tool_call",
+				"call_id":"call_custom_1",
+				"name":"edit",
+				"input":{"filePath":"a.go","oldString":"x","newString":"y"}
+			}
+		]
+	}`)
+
+	converted := convertResponsesJSONToChatCompletion(body, "gpt-5.3-codex", &OpenAIUsage{})
+	var chatResp struct {
+		Choices []struct {
+			FinishReason string `json:"finish_reason"`
+			Message      struct {
+				ToolCalls []struct {
+					ID       string `json:"id"`
+					Function struct {
+						Name      string `json:"name"`
+						Arguments string `json:"arguments"`
+					} `json:"function"`
+				} `json:"tool_calls"`
+			} `json:"message"`
+		} `json:"choices"`
+	}
+	if err := json.Unmarshal(converted, &chatResp); err != nil {
+		t.Fatalf("failed to parse converted response: %v", err)
+	}
+	if len(chatResp.Choices) == 0 {
+		t.Fatalf("expected choices in converted response")
+	}
+	if chatResp.Choices[0].FinishReason != "tool_calls" {
+		t.Fatalf("expected finish_reason tool_calls, got %s", chatResp.Choices[0].FinishReason)
+	}
+	if len(chatResp.Choices[0].Message.ToolCalls) == 0 {
+		t.Fatalf("expected tool_calls in converted response")
+	}
+	call := chatResp.Choices[0].Message.ToolCalls[0]
+	if call.ID != "call_custom_1" {
+		t.Fatalf("expected call_custom_1, got %s", call.ID)
+	}
+	if call.Function.Name != "edit" {
+		t.Fatalf("expected function edit, got %s", call.Function.Name)
+	}
+	if !strings.Contains(call.Function.Arguments, `"filePath":"a.go"`) {
+		t.Fatalf("unexpected function arguments: %s", call.Function.Arguments)
 	}
 }
 
