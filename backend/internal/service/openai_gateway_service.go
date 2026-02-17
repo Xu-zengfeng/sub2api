@@ -818,6 +818,11 @@ func (s *OpenAIGatewayService) Forward(ctx context.Context, c *gin.Context, acco
 			delete(reqBody, "stream_options")
 			bodyModified = true
 		}
+		// ChatGPT Codex OAuth upstream also rejects top-level user.
+		if _, hasUser := reqBody["user"]; hasUser {
+			delete(reqBody, "user")
+			bodyModified = true
+		}
 	}
 
 	// Handle max_output_tokens based on platform and account type
