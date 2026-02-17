@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"io"
 	"net/http"
@@ -1147,5 +1148,102 @@ func TestOpenAIValidateUpstreamBaseURLEnabledEnforcesAllowlist(t *testing.T) {
 	}
 	if _, err := svc.validateUpstreamBaseURL("https://evil.com"); err == nil {
 		t.Fatalf("expected non-allowlisted host to fail")
+	}
+}
+
+func parseChatChunkDelta(t *testing.T, chunk string) map[string]any {
+	t.Helper()
+	var parsed map[string]any
+	if err := json.Unmarshal([]byte(chunk), &parsed); err != nil {
+		t.Fatalf("parse chunk failed: %v, chunk=%s", err, chunk)
+	}
+	choices, ok := parsed["choices"].([]any)
+	if !ok || len(choices) == 0 {
+		t.Fatalf("invalid choices in chunk: %+v", parsed)
+	}
+	first, ok := choices[0].(map[string]any)
+	if !ok {
+		t.Fatalf("invalid first choice in chunk: %+v", parsed)
+	}
+	delta, ok := first["delta"].(map[string]any)
+	if !ok {
+		t.Fatalf("invalid delta in chunk: %+v", parsed)
+	}
+	return delta
+}
+
+func TestConvertResponsesSSEToChatChunks_FunctionCallArgumentsDelta(t *testing.T) {
+	toolState := newChatToolCallState()
+	roleSent := false
+	model := "gpt-5.2"
+	chunks, done := convertResponsesSSEToChatChunks(
+		`{"type":"response.function_call_arguments.delta","output_index":0,"item_id":"fc_1","call_id":"call_abc","name":"edit","delta":"{\"path\":\"a\"}"}`,
+		model,
+		"chatcmpl-test",
+		time.Now().Unix(),
+		&roleSent,
+		toolState,
+	)
+	if done {
+		t.Fatalf("expected not done")
+	}
+	if len(chunks) != 3 {
+		t.Fatalf("expected 3 chunks(role/start/arg), got %d", len(chunks))
+	}
+
+	startDelta := parseChatChunkDelta(t, chunks[1])
+	toolCalls, ok := startDelta["tool_calls"].([]any)
+	if !ok || len(toolCalls) != 1 {
+		t.Fatalf("expected start tool_calls, got %+v", startDelta)
+	}
+	tc, _ := toolCalls[0].(map[string]any)
+	fn, _ := tc["function"].(map[string]any)
+	if fn["name"] != "edit" {
+		t.Fatalf("expected tool name edit, got %+v", fn["name"])
+	}
+
+	argDelta := parseChatChunkDelta(t, chunks[2])
+	argToolCalls, ok := argDelta["tool_calls"].([]any)
+	if !ok || len(argToolCalls) != 1 {
+		t.Fatalf("expected arg tool_calls, got %+v", argDelta)
+	}
+	argTC, _ := argToolCalls[0].(map[string]any)
+	argFn, _ := argTC["function"].(map[string]any)
+	if argFn["arguments"] != "{\"path\":\"a\"}" {
+		t.Fatalf("expected arguments delta, got %+v", argFn["arguments"])
+	}
+}
+
+func TestConvertResponsesSSEToChatChunks_OutputItemDoneAvoidsDuplicateArguments(t *testing.T) {
+	toolState := newChatToolCallState()
+	roleSent := false
+	model := "gpt-5.2"
+	created := time.Now().Unix()
+
+	chunks1, done1 := convertResponsesSSEToChatChunks(
+		`{"type":"response.function_call_arguments.delta","output_index":1,"item_id":"fc_2","call_id":"call_dup","name":"edit","delta":"{\"a\":"}`,
+		model,
+		"chatcmpl-test",
+		created,
+		&roleSent,
+		toolState,
+	)
+	if done1 || len(chunks1) == 0 {
+		t.Fatalf("expected delta chunks before done")
+	}
+
+	chunks2, done2 := convertResponsesSSEToChatChunks(
+		`{"type":"response.output_item.done","output_index":1,"item":{"id":"fc_2","type":"function_call","call_id":"call_dup","name":"edit","arguments":"{\"a\":1}"}}`,
+		model,
+		"chatcmpl-test",
+		created,
+		&roleSent,
+		toolState,
+	)
+	if done2 {
+		t.Fatalf("expected not done for output_item.done")
+	}
+	if len(chunks2) != 0 {
+		t.Fatalf("expected no duplicate argument chunk after deltas, got %d chunks", len(chunks2))
 	}
 }
