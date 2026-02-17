@@ -34,8 +34,9 @@ func RegisterGatewayRoutes(
 		gateway.POST("/messages/count_tokens", h.Gateway.CountTokens)
 		gateway.GET("/models", h.Gateway.Models)
 		gateway.GET("/usage", h.Gateway.Usage)
-		// OpenAI Responses API
+		// OpenAI 兼容 API
 		gateway.POST("/responses", h.OpenAIGateway.Responses)
+		gateway.POST("/chat/completions", h.OpenAIGateway.ChatCompletions)
 	}
 
 	// Gemini 原生 API 兼容层（Gemini SDK/CLI 直连）
@@ -51,8 +52,9 @@ func RegisterGatewayRoutes(
 		gemini.POST("/models/*modelAction", h.Gateway.GeminiV1BetaModels)
 	}
 
-	// OpenAI Responses API（不带v1前缀的别名）
+	// OpenAI 兼容 API（不带 v1 前缀的别名）
 	r.POST("/responses", bodyLimit, clientRequestID, opsErrorLogger, gin.HandlerFunc(apiKeyAuth), h.OpenAIGateway.Responses)
+	r.POST("/chat/completions", bodyLimit, clientRequestID, opsErrorLogger, gin.HandlerFunc(apiKeyAuth), h.OpenAIGateway.ChatCompletions)
 
 	// Antigravity 模型列表
 	r.GET("/antigravity/models", gin.HandlerFunc(apiKeyAuth), h.Gateway.AntigravityModels)

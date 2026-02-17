@@ -32,6 +32,8 @@ const (
 	// OpenAI Platform API for API Key accounts (fallback)
 	openaiPlatformAPIURL   = "https://api.openai.com/v1/responses"
 	openaiStickySessionTTL = time.Hour // 粘性会话TTL
+	// CtxKeyOpenAIChatCompletionsCompat marks requests from /chat/completions.
+	CtxKeyOpenAIChatCompletionsCompat = "openai_chat_completions_compat"
 )
 
 // openaiSSEDataRe matches SSE data lines with optional whitespace after colon.
@@ -1321,6 +1323,13 @@ func (s *OpenAIGatewayService) handleStreamingResponse(ctx context.Context, resp
 	}
 
 	needModelReplace := originalModel != mappedModel
+	chatCompat, _ := c.Get(CtxKeyOpenAIChatCompletionsCompat)
+	isChatCompat, _ := chatCompat.(bool)
+	chatChunkID := buildChatCompletionID(resp.Header.Get("x-request-id"))
+	chatCreated := time.Now().Unix()
+	chatRoleSent := false
+	chatDoneSent := false
+	chatToolState := newChatToolCallState()
 
 	for {
 		select {
@@ -1369,11 +1378,32 @@ func (s *OpenAIGatewayService) handleStreamingResponse(ctx context.Context, resp
 
 				// 写入客户端（客户端断开后继续 drain 上游）
 				if !clientDisconnected {
-					if _, err := fmt.Fprintf(w, "%s\n", line); err != nil {
-						clientDisconnected = true
-						log.Printf("Client disconnected during streaming, continuing to drain upstream for billing")
+					if isChatCompat {
+						chunks, done := convertResponsesSSEToChatChunks(data, originalModel, chatChunkID, chatCreated, &chatRoleSent, chatToolState)
+						for _, chunk := range chunks {
+							if _, err := fmt.Fprintf(w, "data: %s\n\n", chunk); err != nil {
+								clientDisconnected = true
+								log.Printf("Client disconnected during streaming, continuing to drain upstream for billing")
+								break
+							}
+							flusher.Flush()
+						}
+						if !clientDisconnected && done && !chatDoneSent {
+							chatDoneSent = true
+							if _, err := fmt.Fprint(w, "data: [DONE]\n\n"); err != nil {
+								clientDisconnected = true
+								log.Printf("Client disconnected during streaming, continuing to drain upstream for billing")
+							} else {
+								flusher.Flush()
+							}
+						}
 					} else {
-						flusher.Flush()
+						if _, err := fmt.Fprintf(w, "%s\n", line); err != nil {
+							clientDisconnected = true
+							log.Printf("Client disconnected during streaming, continuing to drain upstream for billing")
+						} else {
+							flusher.Flush()
+						}
 					}
 				}
 
@@ -1385,7 +1415,7 @@ func (s *OpenAIGatewayService) handleStreamingResponse(ctx context.Context, resp
 				s.parseSSEUsage(data, usage)
 			} else {
 				// Forward non-data lines as-is
-				if !clientDisconnected {
+				if !clientDisconnected && !isChatCompat {
 					if _, err := fmt.Fprintf(w, "%s\n", line); err != nil {
 						clientDisconnected = true
 						log.Printf("Client disconnected during streaming, continuing to drain upstream for billing")
@@ -1543,6 +1573,12 @@ func (s *OpenAIGatewayService) handleNonStreamingResponse(ctx context.Context, r
 		body = s.replaceModelInResponseBody(body, mappedModel, originalModel)
 	}
 
+	if chatCompatRaw, ok := c.Get(CtxKeyOpenAIChatCompletionsCompat); ok {
+		if chatCompat, _ := chatCompatRaw.(bool); chatCompat {
+			body = convertResponsesJSONToChatCompletion(body, originalModel, usage)
+		}
+	}
+
 	responseheaders.WriteFilteredHeaders(c.Writer.Header(), resp.Header, s.cfg.Security.ResponseHeaders)
 
 	contentType := "application/json"
@@ -1560,6 +1596,275 @@ func (s *OpenAIGatewayService) handleNonStreamingResponse(ctx context.Context, r
 func isEventStreamResponse(header http.Header) bool {
 	contentType := strings.ToLower(header.Get("Content-Type"))
 	return strings.Contains(contentType, "text/event-stream")
+}
+
+func buildChatCompletionID(requestID string) string {
+	rid := strings.TrimSpace(requestID)
+	if rid == "" || rid == "<nil>" {
+		return fmt.Sprintf("chatcmpl-%d", time.Now().UnixNano())
+	}
+	if strings.HasPrefix(rid, "chatcmpl-") {
+		return rid
+	}
+	return "chatcmpl-" + rid
+}
+
+func buildChatChunk(model, id string, created int64, delta map[string]any, finishReason *string) string {
+	chunk := map[string]any{
+		"id":      id,
+		"object":  "chat.completion.chunk",
+		"created": created,
+		"model":   model,
+		"choices": []map[string]any{
+			{
+				"index":         0,
+				"delta":         delta,
+				"finish_reason": finishReason,
+			},
+		},
+	}
+	b, err := json.Marshal(chunk)
+	if err != nil {
+		return ""
+	}
+	return string(b)
+}
+
+type chatToolCallState struct {
+	nextIndex   int
+	itemToIndex map[string]int
+}
+
+func newChatToolCallState() *chatToolCallState {
+	return &chatToolCallState{
+		itemToIndex: make(map[string]int),
+	}
+}
+
+func (s *chatToolCallState) indexFor(itemID string, outputIndex *int) int {
+	if outputIndex != nil && *outputIndex >= 0 {
+		if itemID != "" {
+			s.itemToIndex[itemID] = *outputIndex
+		}
+		if *outputIndex >= s.nextIndex {
+			s.nextIndex = *outputIndex + 1
+		}
+		return *outputIndex
+	}
+	if itemID != "" {
+		if idx, ok := s.itemToIndex[itemID]; ok {
+			return idx
+		}
+	}
+	idx := s.nextIndex
+	s.nextIndex++
+	if itemID != "" {
+		s.itemToIndex[itemID] = idx
+	}
+	return idx
+}
+
+func convertResponsesSSEToChatChunks(data, model, id string, created int64, roleSent *bool, toolState *chatToolCallState) ([]string, bool) {
+	data = strings.TrimSpace(data)
+	if data == "" || data == "[DONE]" {
+		return nil, false
+	}
+
+	var event struct {
+		Type  string `json:"type"`
+		Delta string `json:"delta"`
+	}
+	if err := json.Unmarshal([]byte(data), &event); err != nil {
+		return nil, false
+	}
+
+	switch event.Type {
+	case "response.output_text.delta":
+		out := make([]string, 0, 2)
+		if roleSent != nil && !*roleSent {
+			if chunk := buildChatChunk(model, id, created, map[string]any{"role": "assistant"}, nil); chunk != "" {
+				out = append(out, chunk)
+			}
+			*roleSent = true
+		}
+		if strings.TrimSpace(event.Delta) != "" {
+			if chunk := buildChatChunk(model, id, created, map[string]any{"content": event.Delta}, nil); chunk != "" {
+				out = append(out, chunk)
+			}
+		}
+		return out, false
+	case "response.output_item.done":
+		var payload struct {
+			OutputIndex *int `json:"output_index"`
+			Item        struct {
+				ID        string `json:"id"`
+				Type      string `json:"type"`
+				CallID    string `json:"call_id"`
+				Name      string `json:"name"`
+				Arguments string `json:"arguments"`
+			} `json:"item"`
+		}
+		if err := json.Unmarshal([]byte(data), &payload); err != nil {
+			return nil, false
+		}
+		if payload.Item.Type != "function_call" {
+			return nil, false
+		}
+
+		out := make([]string, 0, 2)
+		if roleSent != nil && !*roleSent {
+			if chunk := buildChatChunk(model, id, created, map[string]any{"role": "assistant"}, nil); chunk != "" {
+				out = append(out, chunk)
+			}
+			*roleSent = true
+		}
+
+		callID := strings.TrimSpace(payload.Item.CallID)
+		if callID == "" {
+			callID = fmt.Sprintf("call_%d", time.Now().UnixNano())
+		}
+		index := 0
+		if toolState != nil {
+			index = toolState.indexFor(payload.Item.ID, payload.OutputIndex)
+		}
+
+		delta := map[string]any{
+			"tool_calls": []map[string]any{
+				{
+					"index": index,
+					"id":    callID,
+					"type":  "function",
+					"function": map[string]any{
+						"name":      payload.Item.Name,
+						"arguments": payload.Item.Arguments,
+					},
+				},
+			},
+		}
+		if chunk := buildChatChunk(model, id, created, delta, nil); chunk != "" {
+			out = append(out, chunk)
+		}
+		return out, false
+	case "response.done", "response.completed":
+		reason := "stop"
+		if toolState != nil && toolState.nextIndex > 0 {
+			reason = "tool_calls"
+		}
+		chunk := buildChatChunk(model, id, created, map[string]any{}, &reason)
+		if chunk == "" {
+			return nil, true
+		}
+		return []string{chunk}, true
+	default:
+		return nil, false
+	}
+}
+
+func convertResponsesJSONToChatCompletion(body []byte, model string, usage *OpenAIUsage) []byte {
+	var resp map[string]any
+	if err := json.Unmarshal(body, &resp); err != nil {
+		return body
+	}
+
+	toolCalls := make([]map[string]any, 0)
+	text := ""
+	if v, ok := resp["output_text"].(string); ok {
+		text = v
+	}
+	if output, ok := resp["output"].([]any); ok {
+		for idx, itemRaw := range output {
+			item, ok := itemRaw.(map[string]any)
+			if !ok {
+				continue
+			}
+			itemType, _ := item["type"].(string)
+			if itemType == "function_call" {
+				callID, _ := item["call_id"].(string)
+				if strings.TrimSpace(callID) == "" {
+					callID = fmt.Sprintf("call_%d", idx)
+				}
+				name, _ := item["name"].(string)
+				arguments, _ := item["arguments"].(string)
+				toolCalls = append(toolCalls, map[string]any{
+					"id":   callID,
+					"type": "function",
+					"function": map[string]any{
+						"name":      name,
+						"arguments": arguments,
+					},
+				})
+				continue
+			}
+
+			if text != "" {
+				continue
+			}
+			content, ok := item["content"].([]any)
+			if !ok {
+				continue
+			}
+			for _, cRaw := range content {
+				cm, ok := cRaw.(map[string]any)
+				if !ok {
+					continue
+				}
+				ct, _ := cm["type"].(string)
+				if (ct == "output_text" || ct == "text") && text == "" {
+					if t, ok := cm["text"].(string); ok {
+						text = t
+					}
+				}
+			}
+		}
+	}
+
+	respModel := model
+	if m, ok := resp["model"].(string); ok && strings.TrimSpace(m) != "" {
+		respModel = m
+	}
+	respID, _ := resp["id"].(string)
+	id := buildChatCompletionID(respID)
+	created := time.Now().Unix()
+
+	message := map[string]any{
+		"role":    "assistant",
+		"content": text,
+	}
+	finishReason := "stop"
+	if len(toolCalls) > 0 {
+		message["content"] = nil
+		message["tool_calls"] = toolCalls
+		finishReason = "tool_calls"
+	}
+
+	out := map[string]any{
+		"id":      id,
+		"object":  "chat.completion",
+		"created": created,
+		"model":   respModel,
+		"choices": []map[string]any{
+			{
+				"index": 0,
+				"message": message,
+				"finish_reason": finishReason,
+			},
+		},
+	}
+	if usage != nil {
+		out["usage"] = map[string]any{
+			"prompt_tokens":     usage.InputTokens,
+			"completion_tokens": usage.OutputTokens,
+			"total_tokens":      usage.InputTokens + usage.OutputTokens,
+			"prompt_tokens_details": map[string]any{
+				"cached_tokens": usage.CacheReadInputTokens,
+			},
+		}
+	}
+	b, err := json.Marshal(out)
+	if err != nil {
+		return body
+	}
+	return b
 }
 
 func (s *OpenAIGatewayService) handleOAuthSSEToJSON(resp *http.Response, c *gin.Context, body []byte, originalModel, mappedModel string) (*OpenAIUsage, error) {
@@ -1594,6 +1899,12 @@ func (s *OpenAIGatewayService) handleOAuthSSEToJSON(resp *http.Response, c *gin.
 			bodyText = s.replaceModelInSSEBody(bodyText, mappedModel, originalModel)
 		}
 		body = []byte(bodyText)
+	}
+
+	if chatCompatRaw, exists := c.Get(CtxKeyOpenAIChatCompletionsCompat); exists {
+		if chatCompat, _ := chatCompatRaw.(bool); chatCompat && ok {
+			body = convertResponsesJSONToChatCompletion(body, originalModel, usage)
+		}
 	}
 
 	responseheaders.WriteFilteredHeaders(c.Writer.Header(), resp.Header, s.cfg.Security.ResponseHeaders)

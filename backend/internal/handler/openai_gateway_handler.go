@@ -1,6 +1,7 @@
 package handler
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -326,6 +327,190 @@ func (h *OpenAIGatewayHandler) Responses(c *gin.Context) {
 			}
 		}(result, account, userAgent, clientIP)
 		return
+	}
+}
+
+// ChatCompletions handles OpenAI Chat Completions compatibility endpoint.
+// POST /v1/chat/completions
+func (h *OpenAIGatewayHandler) ChatCompletions(c *gin.Context) {
+	body, err := io.ReadAll(c.Request.Body)
+	if err != nil {
+		h.errorResponse(c, http.StatusBadRequest, "invalid_request_error", "Failed to read request body")
+		return
+	}
+	if len(body) == 0 {
+		h.errorResponse(c, http.StatusBadRequest, "invalid_request_error", "Request body is empty")
+		return
+	}
+
+	var reqBody map[string]any
+	if err := json.Unmarshal(body, &reqBody); err != nil {
+		h.errorResponse(c, http.StatusBadRequest, "invalid_request_error", "Failed to parse request body")
+		return
+	}
+
+	normalizedReq, convErr := normalizeChatCompletionsRequest(reqBody)
+	if convErr != nil {
+		h.errorResponse(c, http.StatusBadRequest, "invalid_request_error", convErr.Error())
+		return
+	}
+
+	normalizedBody, err := json.Marshal(normalizedReq)
+	if err != nil {
+		h.errorResponse(c, http.StatusInternalServerError, "api_error", "Failed to process request")
+		return
+	}
+
+	c.Set(service.CtxKeyOpenAIChatCompletionsCompat, true)
+	c.Request.Body = io.NopCloser(bytes.NewReader(normalizedBody))
+	c.Request.ContentLength = int64(len(normalizedBody))
+	c.Request.Header.Set("Content-Type", "application/json")
+
+	h.Responses(c)
+}
+
+func normalizeChatCompletionsRequest(req map[string]any) (map[string]any, error) {
+	normalized := make(map[string]any, len(req)+2)
+	for k, v := range req {
+		normalized[k] = v
+	}
+
+	// OpenAI chat.completions commonly uses max_tokens/max_completion_tokens.
+	// Responses API expects max_output_tokens.
+	if _, ok := normalized["max_output_tokens"]; !ok {
+		if v, ok := normalized["max_completion_tokens"]; ok {
+			normalized["max_output_tokens"] = v
+		} else if v, ok := normalized["max_tokens"]; ok {
+			normalized["max_output_tokens"] = v
+		}
+	}
+
+	// Convert chat tools shape to responses tools shape when possible:
+	// {"type":"function","function":{"name":"x","parameters":{...}}}
+	// =>
+	// {"type":"function","name":"x","parameters":{...}}
+	if toolsRaw, ok := normalized["tools"].([]any); ok {
+		convertedTools := make([]any, 0, len(toolsRaw))
+		for _, item := range toolsRaw {
+			toolMap, ok := item.(map[string]any)
+			if !ok {
+				convertedTools = append(convertedTools, item)
+				continue
+			}
+			if toolType, _ := toolMap["type"].(string); toolType == "function" {
+				if fn, ok := toolMap["function"].(map[string]any); ok {
+					converted := map[string]any{"type": "function"}
+					if name, ok := fn["name"]; ok {
+						converted["name"] = name
+					}
+					if desc, ok := fn["description"]; ok {
+						converted["description"] = desc
+					}
+					if params, ok := fn["parameters"]; ok {
+						converted["parameters"] = params
+					}
+					if strict, ok := fn["strict"]; ok {
+						converted["strict"] = strict
+					}
+					convertedTools = append(convertedTools, converted)
+					continue
+				}
+			}
+			convertedTools = append(convertedTools, item)
+		}
+		normalized["tools"] = convertedTools
+	}
+
+	// If input already provided, keep it untouched.
+	if _, ok := normalized["input"]; ok {
+		return normalized, nil
+	}
+
+	messagesRaw, ok := normalized["messages"].([]any)
+	if !ok || len(messagesRaw) == 0 {
+		return nil, fmt.Errorf("messages is required")
+	}
+
+	var systemInstructions []string
+	inputItems := make([]any, 0, len(messagesRaw))
+
+	for _, raw := range messagesRaw {
+		msg, ok := raw.(map[string]any)
+		if !ok {
+			continue
+		}
+		role, _ := msg["role"].(string)
+		if role == "" {
+			continue
+		}
+		content := extractMessageText(msg["content"])
+		if role == "system" {
+			if strings.TrimSpace(content) != "" {
+				systemInstructions = append(systemInstructions, content)
+			}
+			continue
+		}
+		if role == "tool" {
+			item := map[string]any{
+				"type":   "function_call_output",
+				"output": content,
+			}
+			if callID, ok := msg["tool_call_id"].(string); ok && strings.TrimSpace(callID) != "" {
+				item["call_id"] = callID
+			}
+			inputItems = append(inputItems, item)
+			continue
+		}
+		inputItems = append(inputItems, map[string]any{
+			"type": "message",
+			"role": role,
+			"content": []map[string]any{
+				{
+					"type": "input_text",
+					"text": content,
+				},
+			},
+		})
+	}
+
+	if len(inputItems) == 0 {
+		return nil, fmt.Errorf("messages is required")
+	}
+
+	normalized["input"] = inputItems
+	if _, ok := normalized["instructions"]; !ok && len(systemInstructions) > 0 {
+		normalized["instructions"] = strings.Join(systemInstructions, "\n\n")
+	}
+	delete(normalized, "messages")
+
+	return normalized, nil
+}
+
+func extractMessageText(raw any) string {
+	switch v := raw.(type) {
+	case string:
+		return v
+	case []any:
+		parts := make([]string, 0, len(v))
+		for _, partRaw := range v {
+			part, ok := partRaw.(map[string]any)
+			if !ok {
+				continue
+			}
+			partType, _ := part["type"].(string)
+			switch partType {
+			case "text", "input_text", "output_text":
+				if text, ok := part["text"].(string); ok {
+					parts = append(parts, text)
+				}
+			default:
+				// Keep compatibility with simple multimodal placeholders:
+				// ignore non-text segments instead of failing.
+			}
+		}
+		return strings.Join(parts, "")
+	default:
+		return ""
 	}
 }
 
