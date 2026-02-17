@@ -806,6 +806,12 @@ func (s *OpenAIGatewayService) Forward(ctx context.Context, c *gin.Context, acco
 		if codexResult.PromptCacheKey != "" {
 			promptCacheKey = codexResult.PromptCacheKey
 		}
+		// ChatGPT Codex OAuth upstream rejects metadata at request top-level.
+		// Keep gateway compatibility by stripping it before forwarding.
+		if _, hasMetadata := reqBody["metadata"]; hasMetadata {
+			delete(reqBody, "metadata")
+			bodyModified = true
+		}
 	}
 
 	// Handle max_output_tokens based on platform and account type
