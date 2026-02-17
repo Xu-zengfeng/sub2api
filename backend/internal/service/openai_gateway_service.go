@@ -1282,9 +1282,17 @@ func (s *OpenAIGatewayService) handleStreamingResponse(ctx context.Context, resp
 	}()
 	defer close(done)
 
+	chatCompat, _ := c.Get(CtxKeyOpenAIChatCompletionsCompat)
+	isChatCompat, _ := chatCompat.(bool)
+
 	streamInterval := time.Duration(0)
 	if s.cfg != nil && s.cfg.Gateway.StreamDataIntervalTimeout > 0 {
 		streamInterval = time.Duration(s.cfg.Gateway.StreamDataIntervalTimeout) * time.Second
+	}
+	// Chat Completions compatibility mode may have long silent gaps during tool execution.
+	// Avoid prematurely terminating these streams on upstream data interval timeout.
+	if isChatCompat {
+		streamInterval = 0
 	}
 	// 仅监控上游数据间隔超时，不被下游写入阻塞影响
 	var intervalTicker *time.Ticker
@@ -1340,8 +1348,6 @@ func (s *OpenAIGatewayService) handleStreamingResponse(ctx context.Context, resp
 	}
 
 	needModelReplace := originalModel != mappedModel
-	chatCompat, _ := c.Get(CtxKeyOpenAIChatCompletionsCompat)
-	isChatCompat, _ := chatCompat.(bool)
 	chatChunkID := buildChatCompletionID(resp.Header.Get("x-request-id"))
 	chatCreated := time.Now().Unix()
 	chatRoleSent := false
@@ -1764,7 +1770,7 @@ func convertResponsesSSEToChatChunks(data, model, id string, created int64, role
 			}
 			*roleSent = true
 		}
-		if strings.TrimSpace(deltaText) != "" {
+		if deltaText != "" {
 			if chunk := buildChatChunk(model, id, created, map[string]any{"content": deltaText}, nil); chunk != "" {
 				out = append(out, chunk)
 			}
@@ -1861,7 +1867,7 @@ func convertResponsesSSEToChatChunks(data, model, id string, created int64, role
 			}
 		}
 
-		if strings.TrimSpace(deltaText) != "" {
+		if deltaText != "" {
 			if toolState != nil {
 				toolState.markArgDelta(index)
 			}
@@ -1923,7 +1929,7 @@ func convertResponsesSSEToChatChunks(data, model, id string, created int64, role
 				out = append(out, chunk)
 			}
 		}
-		if strings.TrimSpace(arguments) != "" && (toolState == nil || !toolState.hasArgDelta(index)) {
+		if arguments != "" && (toolState == nil || !toolState.hasArgDelta(index)) {
 			argDelta := map[string]any{
 				"tool_calls": []map[string]any{
 					{
@@ -1991,7 +1997,7 @@ func convertResponsesSSEToChatChunks(data, model, id string, created int64, role
 				out = append(out, chunk)
 			}
 		}
-		if strings.TrimSpace(arguments) != "" && (toolState == nil || !toolState.hasArgDelta(index)) {
+		if arguments != "" && (toolState == nil || !toolState.hasArgDelta(index)) {
 			argDelta := map[string]any{
 				"tool_calls": []map[string]any{
 					{

@@ -839,6 +839,48 @@ func TestOpenAIStreamingTimeout(t *testing.T) {
 	}
 }
 
+func TestOpenAIStreamingTimeoutDisabledForChatCompat(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	cfg := &config.Config{
+		Gateway: config.GatewayConfig{
+			StreamDataIntervalTimeout: 1,
+			StreamKeepaliveInterval:   0,
+			MaxLineSize:               defaultMaxLineSize,
+		},
+	}
+	svc := &OpenAIGatewayService{cfg: cfg}
+
+	rec := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(rec)
+	c.Request = httptest.NewRequest(http.MethodPost, "/v1/chat/completions", nil)
+	c.Set(CtxKeyOpenAIChatCompletionsCompat, true)
+
+	pr, pw := io.Pipe()
+	resp := &http.Response{
+		StatusCode: http.StatusOK,
+		Body:       pr,
+		Header:     http.Header{},
+	}
+
+	go func() {
+		defer func() { _ = pw.Close() }()
+		time.Sleep(1500 * time.Millisecond)
+		_, _ = pw.Write([]byte("data: {\"type\":\"response.output_text.delta\",\"delta\":\"hi\"}\n\n"))
+	}()
+
+	_, err := svc.handleStreamingResponse(c.Request.Context(), resp, c, &Account{ID: 3}, time.Now(), "model", "model")
+	_ = pr.Close()
+	if err != nil {
+		t.Fatalf("expected nil error in chat compat mode, got %v", err)
+	}
+	if strings.Contains(rec.Body.String(), "stream_timeout") {
+		t.Fatalf("expected no stream timeout in chat compat mode, got %q", rec.Body.String())
+	}
+	if !strings.Contains(rec.Body.String(), "\"chat.completion.chunk\"") {
+		t.Fatalf("expected chat completion chunks, got %q", rec.Body.String())
+	}
+}
+
 func TestOpenAIStreamingContextCanceledDoesNotInjectErrorEvent(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	cfg := &config.Config{
@@ -1245,5 +1287,56 @@ func TestConvertResponsesSSEToChatChunks_OutputItemDoneAvoidsDuplicateArguments(
 	}
 	if len(chunks2) != 0 {
 		t.Fatalf("expected no duplicate argument chunk after deltas, got %d chunks", len(chunks2))
+	}
+}
+
+func TestConvertResponsesSSEToChatChunks_PreserveWhitespaceDeltas(t *testing.T) {
+	toolState := newChatToolCallState()
+	roleSent := false
+	model := "gpt-5.2"
+	created := time.Now().Unix()
+
+	textChunks, done := convertResponsesSSEToChatChunks(
+		`{"type":"response.output_text.delta","delta":"\n"}`,
+		model,
+		"chatcmpl-test",
+		created,
+		&roleSent,
+		toolState,
+	)
+	if done {
+		t.Fatalf("expected not done")
+	}
+	if len(textChunks) != 2 {
+		t.Fatalf("expected role + newline chunk, got %d", len(textChunks))
+	}
+	textDelta := parseChatChunkDelta(t, textChunks[1])
+	if textDelta["content"] != "\n" {
+		t.Fatalf("expected newline content delta, got %+v", textDelta["content"])
+	}
+
+	argChunks, done := convertResponsesSSEToChatChunks(
+		`{"type":"response.function_call_arguments.delta","output_index":2,"item_id":"fc_ws","call_id":"call_ws","name":"edit","delta":" "}`,
+		model,
+		"chatcmpl-test",
+		created,
+		&roleSent,
+		toolState,
+	)
+	if done {
+		t.Fatalf("expected not done")
+	}
+	if len(argChunks) == 0 {
+		t.Fatalf("expected argument whitespace delta chunk")
+	}
+	lastDelta := parseChatChunkDelta(t, argChunks[len(argChunks)-1])
+	toolCalls, ok := lastDelta["tool_calls"].([]any)
+	if !ok || len(toolCalls) == 0 {
+		t.Fatalf("expected tool_calls delta, got %+v", lastDelta)
+	}
+	tc, _ := toolCalls[0].(map[string]any)
+	fn, _ := tc["function"].(map[string]any)
+	if fn["arguments"] != " " {
+		t.Fatalf("expected whitespace argument delta, got %+v", fn["arguments"])
 	}
 }
