@@ -1650,18 +1650,11 @@ func buildChatChunk(model, id string, created int64, delta map[string]any, finis
 type chatToolCallState struct {
 	nextIndex   int
 	itemToIndex map[string]int
-	itemMeta    map[string]chatToolCallMeta
-}
-
-type chatToolCallMeta struct {
-	callID string
-	name   string
 }
 
 func newChatToolCallState() *chatToolCallState {
 	return &chatToolCallState{
 		itemToIndex: make(map[string]int),
-		itemMeta:    make(map[string]chatToolCallMeta),
 	}
 }
 
@@ -1686,72 +1679,6 @@ func (s *chatToolCallState) indexFor(itemID string, outputIndex *int) int {
 		s.itemToIndex[itemID] = idx
 	}
 	return idx
-}
-
-func (s *chatToolCallState) rememberMeta(itemID, callID, name string) {
-	itemID = strings.TrimSpace(itemID)
-	if itemID == "" {
-		return
-	}
-	meta := s.itemMeta[itemID]
-	if strings.TrimSpace(callID) != "" {
-		meta.callID = callID
-	}
-	if strings.TrimSpace(name) != "" {
-		meta.name = name
-	}
-	s.itemMeta[itemID] = meta
-}
-
-func (s *chatToolCallState) getMeta(itemID string) chatToolCallMeta {
-	itemID = strings.TrimSpace(itemID)
-	if itemID == "" {
-		return chatToolCallMeta{}
-	}
-	return s.itemMeta[itemID]
-}
-
-func normalizeToolCallArguments(item map[string]any) string {
-	if item == nil {
-		return ""
-	}
-	if arguments, ok := item["arguments"].(string); ok {
-		return arguments
-	}
-	if arguments, ok := item["arguments"]; ok && arguments != nil {
-		if b, err := json.Marshal(arguments); err == nil {
-			return string(b)
-		}
-	}
-	if input, ok := item["input"].(string); ok {
-		return input
-	}
-	if input, ok := item["input"]; ok && input != nil {
-		if b, err := json.Marshal(input); err == nil {
-			return string(b)
-		}
-	}
-	return ""
-}
-
-func buildChatToolCallDelta(model, id string, created int64, toolIndex int, callID, name, arguments string) string {
-	if strings.TrimSpace(callID) == "" {
-		callID = fmt.Sprintf("call_%d", time.Now().UnixNano())
-	}
-	delta := map[string]any{
-		"tool_calls": []map[string]any{
-			{
-				"index": toolIndex,
-				"id":    callID,
-				"type":  "function",
-				"function": map[string]any{
-					"name":      name,
-					"arguments": arguments,
-				},
-			},
-		},
-	}
-	return buildChatChunk(model, id, created, delta, nil)
 }
 
 func convertResponsesSSEToChatChunks(data, model, id string, created int64, roleSent *bool, toolState *chatToolCallState) ([]string, bool) {
@@ -1792,13 +1719,12 @@ func convertResponsesSSEToChatChunks(data, model, id string, created int64, role
 				CallID    string `json:"call_id"`
 				Name      string `json:"name"`
 				Arguments string `json:"arguments"`
-				Input     any    `json:"input"`
 			} `json:"item"`
 		}
 		if err := json.Unmarshal([]byte(data), &payload); err != nil {
 			return nil, false
 		}
-		if payload.Item.Type != "function_call" && payload.Item.Type != "custom_tool_call" && payload.Item.Type != "tool_call" {
+		if payload.Item.Type != "function_call" {
 			return nil, false
 		}
 
@@ -1814,80 +1740,25 @@ func convertResponsesSSEToChatChunks(data, model, id string, created int64, role
 		if callID == "" {
 			callID = fmt.Sprintf("call_%d", time.Now().UnixNano())
 		}
-		if toolState != nil {
-			toolState.rememberMeta(payload.Item.ID, callID, payload.Item.Name)
-		}
 		index := 0
 		if toolState != nil {
 			index = toolState.indexFor(payload.Item.ID, payload.OutputIndex)
 		}
-		arguments := strings.TrimSpace(payload.Item.Arguments)
-		if arguments == "" && payload.Item.Input != nil {
-			if b, err := json.Marshal(payload.Item.Input); err == nil {
-				arguments = string(b)
-			}
-		}
 
-		if chunk := buildChatToolCallDelta(model, id, created, index, callID, payload.Item.Name, arguments); chunk != "" {
-			out = append(out, chunk)
+		delta := map[string]any{
+			"tool_calls": []map[string]any{
+				{
+					"index": index,
+					"id":    callID,
+					"type":  "function",
+					"function": map[string]any{
+						"name":      payload.Item.Name,
+						"arguments": payload.Item.Arguments,
+					},
+				},
+			},
 		}
-		return out, false
-	case "response.output_item.added":
-		var payload struct {
-			OutputIndex *int `json:"output_index"`
-			Item        struct {
-				ID     string `json:"id"`
-				Type   string `json:"type"`
-				CallID string `json:"call_id"`
-				Name   string `json:"name"`
-			} `json:"item"`
-		}
-		if err := json.Unmarshal([]byte(data), &payload); err != nil {
-			return nil, false
-		}
-		if payload.Item.Type != "function_call" && payload.Item.Type != "custom_tool_call" && payload.Item.Type != "tool_call" {
-			return nil, false
-		}
-		if toolState != nil {
-			toolState.rememberMeta(payload.Item.ID, payload.Item.CallID, payload.Item.Name)
-			_ = toolState.indexFor(payload.Item.ID, payload.OutputIndex)
-		}
-		return nil, false
-	case "response.function_call_arguments.done":
-		var payload struct {
-			ItemID      string `json:"item_id"`
-			OutputIndex *int   `json:"output_index"`
-			CallID      string `json:"call_id"`
-			Name        string `json:"name"`
-			Arguments   string `json:"arguments"`
-		}
-		if err := json.Unmarshal([]byte(data), &payload); err != nil {
-			return nil, false
-		}
-		out := make([]string, 0, 2)
-		if roleSent != nil && !*roleSent {
-			if chunk := buildChatChunk(model, id, created, map[string]any{"role": "assistant"}, nil); chunk != "" {
-				out = append(out, chunk)
-			}
-			*roleSent = true
-		}
-		callID := strings.TrimSpace(payload.CallID)
-		name := strings.TrimSpace(payload.Name)
-		if toolState != nil {
-			meta := toolState.getMeta(payload.ItemID)
-			if callID == "" {
-				callID = strings.TrimSpace(meta.callID)
-			}
-			if name == "" {
-				name = strings.TrimSpace(meta.name)
-			}
-			toolState.rememberMeta(payload.ItemID, callID, name)
-		}
-		index := 0
-		if toolState != nil {
-			index = toolState.indexFor(payload.ItemID, payload.OutputIndex)
-		}
-		if chunk := buildChatToolCallDelta(model, id, created, index, callID, name, payload.Arguments); chunk != "" {
+		if chunk := buildChatChunk(model, id, created, delta, nil); chunk != "" {
 			out = append(out, chunk)
 		}
 		return out, false
@@ -1924,13 +1795,13 @@ func convertResponsesJSONToChatCompletion(body []byte, model string, usage *Open
 				continue
 			}
 			itemType, _ := item["type"].(string)
-			if itemType == "function_call" || itemType == "custom_tool_call" || itemType == "tool_call" {
+			if itemType == "function_call" {
 				callID, _ := item["call_id"].(string)
 				if strings.TrimSpace(callID) == "" {
 					callID = fmt.Sprintf("call_%d", idx)
 				}
 				name, _ := item["name"].(string)
-				arguments := normalizeToolCallArguments(item)
+				arguments, _ := item["arguments"].(string)
 				toolCalls = append(toolCalls, map[string]any{
 					"id":   callID,
 					"type": "function",
