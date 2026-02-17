@@ -1,0 +1,6 @@
+services:
+  sub2api:
+    build:
+      context: ..
+      dockerfile: Dockerfile
+    image: sub2api-local:dev
