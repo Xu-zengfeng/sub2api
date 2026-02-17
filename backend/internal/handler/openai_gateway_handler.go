@@ -89,6 +89,7 @@ func (h *OpenAIGatewayHandler) Responses(c *gin.Context) {
 		h.errorResponse(c, http.StatusBadRequest, "invalid_request_error", "Request body is empty")
 		return
 	}
+	log.Printf("[OpenAI Handler] /responses raw request body: %s", string(body))
 
 	setOpsRequestContext(c, "", false, body)
 
@@ -121,6 +122,7 @@ func (h *OpenAIGatewayHandler) Responses(c *gin.Context) {
 					h.errorResponse(c, http.StatusInternalServerError, "api_error", "Failed to process request")
 					return
 				}
+				log.Printf("[OpenAI Handler] /responses normalized request body: %s", string(body))
 			}
 		}
 	}
@@ -342,6 +344,7 @@ func (h *OpenAIGatewayHandler) ChatCompletions(c *gin.Context) {
 		h.errorResponse(c, http.StatusBadRequest, "invalid_request_error", "Request body is empty")
 		return
 	}
+	log.Printf("[OpenAI Handler] /chat/completions raw request body: %s", string(body))
 
 	var reqBody map[string]any
 	if err := json.Unmarshal(body, &reqBody); err != nil {
@@ -360,6 +363,7 @@ func (h *OpenAIGatewayHandler) ChatCompletions(c *gin.Context) {
 		h.errorResponse(c, http.StatusInternalServerError, "api_error", "Failed to process request")
 		return
 	}
+	log.Printf("[OpenAI Handler] /chat/completions normalized->responses body: %s", string(normalizedBody))
 
 	c.Set(service.CtxKeyOpenAIChatCompletionsCompat, true)
 	c.Request.Body = io.NopCloser(bytes.NewReader(normalizedBody))
