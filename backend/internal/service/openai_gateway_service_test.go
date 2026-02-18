@@ -1299,7 +1299,7 @@ func TestConvertResponsesSSEToChatChunks_FunctionCallArgumentsDelta(t *testing.T
 	}
 }
 
-func TestConvertResponsesSSEToChatChunks_OutputItemDoneAvoidsDuplicateArguments(t *testing.T) {
+func TestConvertResponsesSSEToChatChunks_OutputItemDoneEmitsTailArguments(t *testing.T) {
 	toolState := newChatToolCallState()
 	roleSent := false
 	model := "gpt-5.2"
@@ -1328,8 +1328,18 @@ func TestConvertResponsesSSEToChatChunks_OutputItemDoneAvoidsDuplicateArguments(
 	if done2 {
 		t.Fatalf("expected not done for output_item.done")
 	}
-	if len(chunks2) != 0 {
-		t.Fatalf("expected no duplicate argument chunk after deltas, got %d chunks", len(chunks2))
+	if len(chunks2) != 1 {
+		t.Fatalf("expected one tail chunk from output_item.done, got %d chunks", len(chunks2))
+	}
+	tailDelta := parseChatChunkDelta(t, chunks2[0])
+	tailToolCalls, ok := tailDelta["tool_calls"].([]any)
+	if !ok || len(tailToolCalls) != 1 {
+		t.Fatalf("expected tool_calls in tail chunk, got %+v", tailDelta)
+	}
+	tailTC, _ := tailToolCalls[0].(map[string]any)
+	tailFn, _ := tailTC["function"].(map[string]any)
+	if tailFn["arguments"] != "1}" {
+		t.Fatalf("expected tail arguments 1}, got %+v", tailFn["arguments"])
 	}
 }
 
@@ -1381,5 +1391,37 @@ func TestConvertResponsesSSEToChatChunks_PreserveWhitespaceDeltas(t *testing.T) 
 	fn, _ := tc["function"].(map[string]any)
 	if fn["arguments"] != " " {
 		t.Fatalf("expected whitespace argument delta, got %+v", fn["arguments"])
+	}
+}
+
+func TestConvertResponsesSSEToChatChunks_ResponseCompletedWithFunctionCall(t *testing.T) {
+	toolState := newChatToolCallState()
+	roleSent := false
+	model := "gpt-5.2"
+	created := time.Now().Unix()
+
+	chunks, done := convertResponsesSSEToChatChunks(
+		`{"type":"response.completed","response":{"output":[{"id":"fc_9","type":"function_call","call_id":"call_fc9","name":"edit_file","arguments":"{\"path\":\"README.md\"}"}]}}`,
+		model,
+		"chatcmpl-test",
+		created,
+		&roleSent,
+		toolState,
+	)
+	if !done {
+		t.Fatalf("expected done=true")
+	}
+	if len(chunks) < 3 {
+		t.Fatalf("expected role/start/args/final chunks, got %d", len(chunks))
+	}
+	startDelta := parseChatChunkDelta(t, chunks[1])
+	toolCalls, ok := startDelta["tool_calls"].([]any)
+	if !ok || len(toolCalls) != 1 {
+		t.Fatalf("expected start tool_calls in completed event, got %+v", startDelta)
+	}
+	tc, _ := toolCalls[0].(map[string]any)
+	fn, _ := tc["function"].(map[string]any)
+	if fn["name"] != "edit_file" {
+		t.Fatalf("unexpected function name: %+v", fn["name"])
 	}
 }

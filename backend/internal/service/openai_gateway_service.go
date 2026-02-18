@@ -1675,6 +1675,7 @@ type chatToolCallState struct {
 	indexToCallID  map[int]string
 	startedIndices map[int]bool
 	argDeltaSeen   map[int]bool
+	argAccumulated map[int]string
 }
 
 func newChatToolCallState() *chatToolCallState {
@@ -1684,6 +1685,7 @@ func newChatToolCallState() *chatToolCallState {
 		indexToCallID:  make(map[int]string),
 		startedIndices: make(map[int]bool),
 		argDeltaSeen:   make(map[int]bool),
+		argAccumulated: make(map[int]string),
 	}
 }
 
@@ -1742,6 +1744,32 @@ func (s *chatToolCallState) markArgDelta(index int) {
 
 func (s *chatToolCallState) hasArgDelta(index int) bool {
 	return s.argDeltaSeen[index]
+}
+
+func (s *chatToolCallState) appendArgDelta(index int, delta string) {
+	s.argAccumulated[index] = s.argAccumulated[index] + delta
+}
+
+func (s *chatToolCallState) doneDelta(index int, full string) string {
+	if full == "" {
+		return ""
+	}
+	acc := s.argAccumulated[index]
+	if acc == "" {
+		s.argAccumulated[index] = full
+		return full
+	}
+	if full == acc {
+		return ""
+	}
+	if strings.HasPrefix(full, acc) {
+		tail := full[len(acc):]
+		s.argAccumulated[index] = full
+		return tail
+	}
+	// Fallback: upstream may resend with a different chunking strategy.
+	s.argAccumulated[index] = full
+	return full
 }
 
 func intPtrFromAny(v any) *int {
@@ -1885,6 +1913,7 @@ func convertResponsesSSEToChatChunks(data, model, id string, created int64, role
 		if deltaText != "" {
 			if toolState != nil {
 				toolState.markArgDelta(index)
+				toolState.appendArgDelta(index, deltaText)
 			}
 			argDelta := map[string]any{
 				"tool_calls": []map[string]any{
@@ -1944,13 +1973,17 @@ func convertResponsesSSEToChatChunks(data, model, id string, created int64, role
 				out = append(out, chunk)
 			}
 		}
-		if arguments != "" && (toolState == nil || !toolState.hasArgDelta(index)) {
+		argumentsDelta := arguments
+		if toolState != nil {
+			argumentsDelta = toolState.doneDelta(index, arguments)
+		}
+		if argumentsDelta != "" {
 			argDelta := map[string]any{
 				"tool_calls": []map[string]any{
 					{
 						"index": index,
 						"function": map[string]any{
-							"arguments": arguments,
+							"arguments": argumentsDelta,
 						},
 					},
 				},
@@ -2012,13 +2045,17 @@ func convertResponsesSSEToChatChunks(data, model, id string, created int64, role
 				out = append(out, chunk)
 			}
 		}
-		if arguments != "" && (toolState == nil || !toolState.hasArgDelta(index)) {
+		argumentsDelta := arguments
+		if toolState != nil {
+			argumentsDelta = toolState.doneDelta(index, arguments)
+		}
+		if argumentsDelta != "" {
 			argDelta := map[string]any{
 				"tool_calls": []map[string]any{
 					{
 						"index": index,
 						"function": map[string]any{
-							"arguments": arguments,
+							"arguments": argumentsDelta,
 						},
 					},
 				},
@@ -2028,7 +2065,95 @@ func convertResponsesSSEToChatChunks(data, model, id string, created int64, role
 			}
 		}
 		return out, false
-	case "response.done", "response.completed":
+	case "response.completed":
+		out := make([]string, 0, 8)
+		responseRaw, _ := payload["response"].(map[string]any)
+		if responseRaw != nil {
+			if outputRaw, ok := responseRaw["output"].([]any); ok {
+				for i, itemRaw := range outputRaw {
+					item, ok := itemRaw.(map[string]any)
+					if !ok {
+						continue
+					}
+					itemType, _ := item["type"].(string)
+					if itemType != "function_call" {
+						continue
+					}
+					itemID, _ := item["id"].(string)
+					callIDRaw, _ := item["call_id"].(string)
+					name, _ := item["name"].(string)
+					arguments, _ := item["arguments"].(string)
+
+					index := i
+					if toolState != nil {
+						index = toolState.indexFor(itemID, intPtrFromAny(item["output_index"]))
+						callIDRaw = toolState.callIDFor(index, itemID, callIDRaw)
+					} else if strings.TrimSpace(callIDRaw) == "" {
+						callIDRaw = fmt.Sprintf("call_%d", time.Now().UnixNano())
+					}
+
+					if roleSent != nil && !*roleSent {
+						if chunk := buildChatChunk(model, id, created, map[string]any{"role": "assistant"}, nil); chunk != "" {
+							out = append(out, chunk)
+						}
+						*roleSent = true
+					}
+
+					startNeeded := true
+					if toolState != nil {
+						startNeeded = toolState.markStarted(index)
+					}
+					if startNeeded {
+						startDelta := map[string]any{
+							"tool_calls": []map[string]any{
+								{
+									"index": index,
+									"id":    callIDRaw,
+									"type":  "function",
+									"function": map[string]any{
+										"name":      name,
+										"arguments": "",
+									},
+								},
+							},
+						}
+						if chunk := buildChatChunk(model, id, created, startDelta, nil); chunk != "" {
+							out = append(out, chunk)
+						}
+					}
+					argumentsDelta := arguments
+					if toolState != nil {
+						argumentsDelta = toolState.doneDelta(index, arguments)
+					}
+					if argumentsDelta != "" {
+						argDelta := map[string]any{
+							"tool_calls": []map[string]any{
+								{
+									"index": index,
+									"function": map[string]any{
+										"arguments": argumentsDelta,
+									},
+								},
+							},
+						}
+						if chunk := buildChatChunk(model, id, created, argDelta, nil); chunk != "" {
+							out = append(out, chunk)
+						}
+					}
+				}
+			}
+		}
+		reason := "stop"
+		if toolState != nil && toolState.nextIndex > 0 {
+			reason = "tool_calls"
+		}
+		chunk := buildChatChunk(model, id, created, map[string]any{}, &reason)
+		if chunk == "" {
+			return out, true
+		}
+		out = append(out, chunk)
+		return out, true
+	case "response.done":
 		reason := "stop"
 		if toolState != nil && toolState.nextIndex > 0 {
 			reason = "tool_calls"
