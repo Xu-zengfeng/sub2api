@@ -444,6 +444,7 @@ func normalizeChatCompletionsRequest(req map[string]any) (map[string]any, error)
 			continue
 		}
 		content := extractMessageText(msg["content"])
+		contentParts := buildResponsesInputContent(msg["content"])
 		if role == "system" {
 			if strings.TrimSpace(content) != "" {
 				systemInstructions = append(systemInstructions, content)
@@ -497,16 +498,11 @@ func normalizeChatCompletionsRequest(req map[string]any) (map[string]any, error)
 				}
 				// Some clients send assistant text + tool_calls in the same message.
 				// Preserve text as a normal assistant message so downstream context stays intact.
-				if strings.TrimSpace(content) != "" {
+				if hasNonEmptyMessageContent(contentParts) {
 					inputItems = append(inputItems, map[string]any{
 						"type": "message",
 						"role": role,
-						"content": []map[string]any{
-							{
-								"type": "input_text",
-								"text": content,
-							},
-						},
+						"content": contentParts,
 					})
 				}
 				continue
@@ -526,12 +522,7 @@ func normalizeChatCompletionsRequest(req map[string]any) (map[string]any, error)
 		inputItems = append(inputItems, map[string]any{
 			"type": "message",
 			"role": role,
-			"content": []map[string]any{
-				{
-					"type": "input_text",
-					"text": content,
-				},
-			},
+			"content": ensureNonEmptyMessageContent(contentParts, content),
 		})
 	}
 
@@ -573,6 +564,113 @@ func extractMessageText(raw any) string {
 		return strings.Join(parts, "")
 	default:
 		return ""
+	}
+}
+
+func buildResponsesInputContent(raw any) []map[string]any {
+	switch v := raw.(type) {
+	case string:
+		return []map[string]any{
+			{
+				"type": "input_text",
+				"text": v,
+			},
+		}
+	case []any:
+		parts := make([]map[string]any, 0, len(v))
+		for _, partRaw := range v {
+			part, ok := partRaw.(map[string]any)
+			if !ok {
+				continue
+			}
+			partType, _ := part["type"].(string)
+			switch partType {
+			case "text", "input_text", "output_text":
+				if text, ok := part["text"].(string); ok {
+					parts = append(parts, map[string]any{
+						"type": "input_text",
+						"text": text,
+					})
+				}
+			case "image_url":
+				url, detail := extractImageURLPart(part["image_url"])
+				if strings.TrimSpace(url) == "" {
+					continue
+				}
+				item := map[string]any{
+					"type":      "input_image",
+					"image_url": url,
+				}
+				if strings.TrimSpace(detail) != "" {
+					item["detail"] = detail
+				}
+				parts = append(parts, item)
+			case "input_image":
+				item := map[string]any{"type": "input_image"}
+				if imageURL, ok := part["image_url"].(string); ok && strings.TrimSpace(imageURL) != "" {
+					item["image_url"] = imageURL
+				}
+				if detail, ok := part["detail"].(string); ok && strings.TrimSpace(detail) != "" {
+					item["detail"] = detail
+				}
+				if fileID, ok := part["file_id"].(string); ok && strings.TrimSpace(fileID) != "" {
+					item["file_id"] = fileID
+				}
+				if len(item) > 1 {
+					parts = append(parts, item)
+				}
+			default:
+				// Ignore unsupported multimodal segments to keep compatibility.
+			}
+		}
+		return parts
+	default:
+		return nil
+	}
+}
+
+func extractImageURLPart(raw any) (url string, detail string) {
+	switch v := raw.(type) {
+	case string:
+		return v, ""
+	case map[string]any:
+		url, _ = v["url"].(string)
+		detail, _ = v["detail"].(string)
+		return url, detail
+	default:
+		return "", ""
+	}
+}
+
+func hasNonEmptyMessageContent(parts []map[string]any) bool {
+	for _, part := range parts {
+		partType, _ := part["type"].(string)
+		switch partType {
+		case "input_text":
+			if text, ok := part["text"].(string); ok && strings.TrimSpace(text) != "" {
+				return true
+			}
+		case "input_image":
+			if imageURL, ok := part["image_url"].(string); ok && strings.TrimSpace(imageURL) != "" {
+				return true
+			}
+			if fileID, ok := part["file_id"].(string); ok && strings.TrimSpace(fileID) != "" {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func ensureNonEmptyMessageContent(parts []map[string]any, fallbackText string) []map[string]any {
+	if len(parts) > 0 {
+		return parts
+	}
+	return []map[string]any{
+		{
+			"type": "input_text",
+			"text": fallbackText,
+		},
 	}
 }
 
