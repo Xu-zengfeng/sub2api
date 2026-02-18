@@ -1425,3 +1425,47 @@ func TestConvertResponsesSSEToChatChunks_ResponseCompletedWithFunctionCall(t *te
 		t.Fatalf("unexpected function name: %+v", fn["name"])
 	}
 }
+
+func TestConvertResponsesSSEToChatChunks_CustomToolInputDelta(t *testing.T) {
+	toolState := newChatToolCallState()
+	roleSent := false
+	model := "gpt-5.2"
+	created := time.Now().Unix()
+
+	added, done := convertResponsesSSEToChatChunks(
+		`{"type":"response.output_item.added","output_index":2,"item":{"id":"ctc_1","type":"custom_tool_call","name":"terminal"}}`,
+		model,
+		"chatcmpl-test",
+		created,
+		&roleSent,
+		toolState,
+	)
+	if done || len(added) < 2 {
+		t.Fatalf("expected role/start chunks for custom_tool_call, got done=%v len=%d", done, len(added))
+	}
+
+	deltaChunks, done := convertResponsesSSEToChatChunks(
+		`{"type":"response.custom_tool_call_input.delta","output_index":2,"item_id":"ctc_1","delta":"{\"cmd\":\"ls\"}"}`,
+		model,
+		"chatcmpl-test",
+		created,
+		&roleSent,
+		toolState,
+	)
+	if done {
+		t.Fatalf("expected not done")
+	}
+	if len(deltaChunks) < 1 {
+		t.Fatalf("expected at least one custom tool delta chunk")
+	}
+	last := parseChatChunkDelta(t, deltaChunks[len(deltaChunks)-1])
+	toolCalls, ok := last["tool_calls"].([]any)
+	if !ok || len(toolCalls) != 1 {
+		t.Fatalf("expected tool_calls delta, got %+v", last)
+	}
+	tc, _ := toolCalls[0].(map[string]any)
+	fn, _ := tc["function"].(map[string]any)
+	if fn["arguments"] != "{\"cmd\":\"ls\"}" {
+		t.Fatalf("unexpected custom tool arguments: %+v", fn["arguments"])
+	}
+}

@@ -1688,7 +1688,9 @@ type chatToolCallState struct {
 	nextIndex      int
 	itemToIndex    map[string]int
 	itemToCallID   map[string]string
+	itemToName     map[string]string
 	indexToCallID  map[int]string
+	indexToName    map[int]string
 	startedIndices map[int]bool
 	argDeltaSeen   map[int]bool
 	argAccumulated map[int]string
@@ -1698,7 +1700,9 @@ func newChatToolCallState() *chatToolCallState {
 	return &chatToolCallState{
 		itemToIndex:    make(map[string]int),
 		itemToCallID:   make(map[string]string),
+		itemToName:     make(map[string]string),
 		indexToCallID:  make(map[int]string),
+		indexToName:    make(map[int]string),
 		startedIndices: make(map[int]bool),
 		argDeltaSeen:   make(map[int]bool),
 		argAccumulated: make(map[int]string),
@@ -1744,6 +1748,27 @@ func (s *chatToolCallState) callIDFor(index int, itemID, rawCallID string) strin
 	}
 	s.indexToCallID[index] = callID
 	return callID
+}
+
+func (s *chatToolCallState) nameFor(index int, itemID, rawName, fallback string) string {
+	name := strings.TrimSpace(rawName)
+	if name == "" && itemID != "" {
+		name = strings.TrimSpace(s.itemToName[itemID])
+	}
+	if name == "" {
+		name = strings.TrimSpace(s.indexToName[index])
+	}
+	if name == "" {
+		name = strings.TrimSpace(fallback)
+	}
+	if name == "" {
+		name = "custom_tool"
+	}
+	if itemID != "" {
+		s.itemToName[itemID] = name
+	}
+	s.indexToName[index] = name
+	return name
 }
 
 func (s *chatToolCallState) markStarted(index int) bool {
@@ -1862,7 +1887,7 @@ func convertResponsesSSEToChatChunks(data, model, id string, created int64, role
 			return nil, false
 		}
 		itemType, _ := itemRaw["type"].(string)
-		if itemType != "function_call" {
+		if itemType != "function_call" && itemType != "custom_tool_call" {
 			return nil, false
 		}
 		itemID, _ := itemRaw["id"].(string)
@@ -1872,6 +1897,7 @@ func convertResponsesSSEToChatChunks(data, model, id string, created int64, role
 		if toolState != nil {
 			index = toolState.indexFor(itemID, intPtrFromAny(payload["output_index"]))
 			callIDRaw = toolState.callIDFor(index, itemID, callIDRaw)
+			name = toolState.nameFor(index, itemID, name, "custom_tool")
 			if !toolState.markStarted(index) {
 				return nil, false
 			}
@@ -1901,6 +1927,143 @@ func convertResponsesSSEToChatChunks(data, model, id string, created int64, role
 		}
 		if chunk := buildChatChunk(model, id, created, delta, nil); chunk != "" {
 			out = append(out, chunk)
+		}
+		return out, false
+	case "response.custom_tool_call_input.delta":
+		itemID, _ := payload["item_id"].(string)
+		callIDRaw, _ := payload["call_id"].(string)
+		name, _ := payload["name"].(string)
+		deltaText, _ := payload["delta"].(string)
+		index := 0
+		if toolState != nil {
+			index = toolState.indexFor(itemID, intPtrFromAny(payload["output_index"]))
+			callIDRaw = toolState.callIDFor(index, itemID, callIDRaw)
+			name = toolState.nameFor(index, itemID, name, "custom_tool")
+		} else {
+			if strings.TrimSpace(callIDRaw) == "" {
+				callIDRaw = fmt.Sprintf("call_%d", time.Now().UnixNano())
+			}
+			if strings.TrimSpace(name) == "" {
+				name = "custom_tool"
+			}
+		}
+
+		out := make([]string, 0, 3)
+		if roleSent != nil && !*roleSent {
+			if chunk := buildChatChunk(model, id, created, map[string]any{"role": "assistant"}, nil); chunk != "" {
+				out = append(out, chunk)
+			}
+			*roleSent = true
+		}
+
+		startNeeded := true
+		if toolState != nil {
+			startNeeded = toolState.markStarted(index)
+		}
+		if startNeeded {
+			startDelta := map[string]any{
+				"tool_calls": []map[string]any{
+					{
+						"index": index,
+						"id":    callIDRaw,
+						"type":  "function",
+						"function": map[string]any{
+							"name":      name,
+							"arguments": "",
+						},
+					},
+				},
+			}
+			if chunk := buildChatChunk(model, id, created, startDelta, nil); chunk != "" {
+				out = append(out, chunk)
+			}
+		}
+		if deltaText != "" {
+			if toolState != nil {
+				toolState.markArgDelta(index)
+				toolState.appendArgDelta(index, deltaText)
+			}
+			argDelta := map[string]any{
+				"tool_calls": []map[string]any{
+					{
+						"index": index,
+						"function": map[string]any{
+							"arguments": deltaText,
+						},
+					},
+				},
+			}
+			if chunk := buildChatChunk(model, id, created, argDelta, nil); chunk != "" {
+				out = append(out, chunk)
+			}
+		}
+		return out, false
+	case "response.custom_tool_call_input.done":
+		itemID, _ := payload["item_id"].(string)
+		callIDRaw, _ := payload["call_id"].(string)
+		name, _ := payload["name"].(string)
+		inputText, _ := payload["input"].(string)
+		index := 0
+		if toolState != nil {
+			index = toolState.indexFor(itemID, intPtrFromAny(payload["output_index"]))
+			callIDRaw = toolState.callIDFor(index, itemID, callIDRaw)
+			name = toolState.nameFor(index, itemID, name, "custom_tool")
+		} else {
+			if strings.TrimSpace(callIDRaw) == "" {
+				callIDRaw = fmt.Sprintf("call_%d", time.Now().UnixNano())
+			}
+			if strings.TrimSpace(name) == "" {
+				name = "custom_tool"
+			}
+		}
+
+		out := make([]string, 0, 3)
+		if roleSent != nil && !*roleSent {
+			if chunk := buildChatChunk(model, id, created, map[string]any{"role": "assistant"}, nil); chunk != "" {
+				out = append(out, chunk)
+			}
+			*roleSent = true
+		}
+		startNeeded := true
+		if toolState != nil {
+			startNeeded = toolState.markStarted(index)
+		}
+		if startNeeded {
+			startDelta := map[string]any{
+				"tool_calls": []map[string]any{
+					{
+						"index": index,
+						"id":    callIDRaw,
+						"type":  "function",
+						"function": map[string]any{
+							"name":      name,
+							"arguments": "",
+						},
+					},
+				},
+			}
+			if chunk := buildChatChunk(model, id, created, startDelta, nil); chunk != "" {
+				out = append(out, chunk)
+			}
+		}
+		argsDelta := inputText
+		if toolState != nil {
+			argsDelta = toolState.doneDelta(index, inputText)
+		}
+		if argsDelta != "" {
+			argDelta := map[string]any{
+				"tool_calls": []map[string]any{
+					{
+						"index": index,
+						"function": map[string]any{
+							"arguments": argsDelta,
+						},
+					},
+				},
+			}
+			if chunk := buildChatChunk(model, id, created, argDelta, nil); chunk != "" {
+				out = append(out, chunk)
+			}
 		}
 		return out, false
 	case "response.function_call_arguments.delta":
@@ -2036,13 +2199,24 @@ func convertResponsesSSEToChatChunks(data, model, id string, created int64, role
 			return nil, false
 		}
 		itemType, _ := itemRaw["type"].(string)
-		if itemType != "function_call" {
+		if itemType != "function_call" && itemType != "custom_tool_call" {
 			return nil, false
 		}
 		itemID, _ := itemRaw["id"].(string)
 		callIDRaw, _ := itemRaw["call_id"].(string)
 		name, _ := itemRaw["name"].(string)
 		arguments, _ := itemRaw["arguments"].(string)
+		if itemType == "custom_tool_call" && arguments == "" {
+			switch v := itemRaw["input"].(type) {
+			case string:
+				arguments = v
+			case nil:
+			default:
+				if b, err := json.Marshal(v); err == nil {
+					arguments = string(b)
+				}
+			}
+		}
 
 		out := make([]string, 0, 3)
 		if roleSent != nil && !*roleSent {
@@ -2056,6 +2230,7 @@ func convertResponsesSSEToChatChunks(data, model, id string, created int64, role
 		if toolState != nil {
 			index = toolState.indexFor(itemID, intPtrFromAny(payload["output_index"]))
 			callIDRaw = toolState.callIDFor(index, itemID, callIDRaw)
+			name = toolState.nameFor(index, itemID, name, "custom_tool")
 		} else if strings.TrimSpace(callIDRaw) == "" {
 			callIDRaw = fmt.Sprintf("call_%d", time.Now().UnixNano())
 		}
@@ -2113,18 +2288,30 @@ func convertResponsesSSEToChatChunks(data, model, id string, created int64, role
 						continue
 					}
 					itemType, _ := item["type"].(string)
-					if itemType != "function_call" {
+					if itemType != "function_call" && itemType != "custom_tool_call" {
 						continue
 					}
 					itemID, _ := item["id"].(string)
 					callIDRaw, _ := item["call_id"].(string)
 					name, _ := item["name"].(string)
 					arguments, _ := item["arguments"].(string)
+					if itemType == "custom_tool_call" && arguments == "" {
+						switch v := item["input"].(type) {
+						case string:
+							arguments = v
+						case nil:
+						default:
+							if b, err := json.Marshal(v); err == nil {
+								arguments = string(b)
+							}
+						}
+					}
 
 					index := i
 					if toolState != nil {
 						index = toolState.indexFor(itemID, intPtrFromAny(item["output_index"]))
 						callIDRaw = toolState.callIDFor(index, itemID, callIDRaw)
+						name = toolState.nameFor(index, itemID, name, "custom_tool")
 					} else if strings.TrimSpace(callIDRaw) == "" {
 						callIDRaw = fmt.Sprintf("call_%d", time.Now().UnixNano())
 					}
