@@ -9,6 +9,7 @@ import (
 	"io"
 	"log"
 	"net/http"
+	"sort"
 	"strings"
 	"time"
 
@@ -348,11 +349,45 @@ func (h *OpenAIGatewayHandler) ChatCompletions(c *gin.Context) {
 		h.errorResponse(c, http.StatusBadRequest, "invalid_request_error", "Failed to parse request body")
 		return
 	}
+	reqModel, _ := reqBody["model"].(string)
+	rawStats := collectRawChatContentStats(reqBody["messages"])
 
 	normalizedReq, convErr := normalizeChatCompletionsRequest(reqBody)
 	if convErr != nil {
+		if rawStats.RawImageParts > 0 || rawStats.RawInvalidImageParts > 0 || rawStats.RawUnknownParts > 0 {
+			log.Printf("[OpenAI ChatCompat] normalization failed: model=%s raw_images=%d invalid_images=%d unknown_parts=%d unknown_types=%s error=%v",
+				reqModel,
+				rawStats.RawImageParts,
+				rawStats.RawInvalidImageParts,
+				rawStats.RawUnknownParts,
+				rawStats.UnknownTypesString(),
+				convErr,
+			)
+		}
 		h.errorResponse(c, http.StatusBadRequest, "invalid_request_error", convErr.Error())
 		return
+	}
+	normalizedStats := collectNormalizedChatInputStats(normalizedReq["input"])
+	if rawStats.RawImageParts > 0 || rawStats.RawUnknownParts > 0 || rawStats.RawInvalidImageParts > 0 {
+		log.Printf("[OpenAI ChatCompat] multimodal normalization: model=%s raw_messages=%d raw_images=%d invalid_images=%d raw_unknown_parts=%d unknown_types=%s normalized_input_items=%d normalized_images=%d normalized_text_parts=%d",
+			reqModel,
+			rawStats.RawMessages,
+			rawStats.RawImageParts,
+			rawStats.RawInvalidImageParts,
+			rawStats.RawUnknownParts,
+			rawStats.UnknownTypesString(),
+			normalizedStats.InputItems,
+			normalizedStats.InputImageParts,
+			normalizedStats.InputTextParts,
+		)
+	}
+	if rawStats.RawImageParts > normalizedStats.InputImageParts {
+		log.Printf("[OpenAI ChatCompat] image parts dropped during normalization: model=%s raw_images=%d normalized_images=%d dropped=%d",
+			reqModel,
+			rawStats.RawImageParts,
+			normalizedStats.InputImageParts,
+			rawStats.RawImageParts-normalizedStats.InputImageParts,
+		)
 	}
 
 	normalizedBody, err := json.Marshal(normalizedReq)
@@ -672,6 +707,134 @@ func ensureNonEmptyMessageContent(parts []map[string]any, fallbackText string) [
 			"text": fallbackText,
 		},
 	}
+}
+
+type rawChatContentStats struct {
+	RawMessages          int
+	RawImageParts        int
+	RawInvalidImageParts int
+	RawUnknownParts      int
+	unknownTypes         map[string]int
+}
+
+func (s rawChatContentStats) UnknownTypesString() string {
+	if len(s.unknownTypes) == 0 {
+		return "-"
+	}
+	keys := make([]string, 0, len(s.unknownTypes))
+	for k := range s.unknownTypes {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	parts := make([]string, 0, len(keys))
+	for _, k := range keys {
+		parts = append(parts, fmt.Sprintf("%s:%d", k, s.unknownTypes[k]))
+	}
+	return strings.Join(parts, ",")
+}
+
+type normalizedChatInputStats struct {
+	InputItems      int
+	InputImageParts int
+	InputTextParts  int
+}
+
+func collectRawChatContentStats(messages any) rawChatContentStats {
+	stats := rawChatContentStats{unknownTypes: make(map[string]int)}
+	items, ok := messages.([]any)
+	if !ok {
+		return stats
+	}
+	stats.RawMessages = len(items)
+	for _, msgRaw := range items {
+		msg, ok := msgRaw.(map[string]any)
+		if !ok {
+			continue
+		}
+		contentRaw, exists := msg["content"]
+		if !exists {
+			continue
+		}
+		switch content := contentRaw.(type) {
+		case string:
+			// string content has no explicit multimodal part type.
+			continue
+		case []any:
+			for _, partRaw := range content {
+				part, ok := partRaw.(map[string]any)
+				if !ok {
+					stats.RawUnknownParts++
+					stats.unknownTypes["non_object"]++
+					continue
+				}
+				partType, _ := part["type"].(string)
+				switch partType {
+				case "text", "input_text", "output_text":
+					continue
+				case "image_url":
+					stats.RawImageParts++
+					url, _ := extractImageURLPart(part["image_url"])
+					if strings.TrimSpace(url) == "" {
+						stats.RawInvalidImageParts++
+					}
+				case "input_image":
+					stats.RawImageParts++
+					url, _ := part["image_url"].(string)
+					fileID, _ := part["file_id"].(string)
+					if strings.TrimSpace(url) == "" && strings.TrimSpace(fileID) == "" {
+						stats.RawInvalidImageParts++
+					}
+				default:
+					stats.RawUnknownParts++
+					key := strings.TrimSpace(partType)
+					if key == "" {
+						key = "unknown"
+					}
+					stats.unknownTypes[key]++
+				}
+			}
+		default:
+			stats.RawUnknownParts++
+			stats.unknownTypes["non_array_content"]++
+		}
+	}
+	return stats
+}
+
+func collectNormalizedChatInputStats(input any) normalizedChatInputStats {
+	stats := normalizedChatInputStats{}
+	items, ok := input.([]any)
+	if !ok {
+		return stats
+	}
+	stats.InputItems = len(items)
+	for _, itemRaw := range items {
+		item, ok := itemRaw.(map[string]any)
+		if !ok {
+			continue
+		}
+		if itemType, _ := item["type"].(string); itemType != "message" {
+			continue
+		}
+		contentRaw, ok := item["content"]
+		if !ok {
+			continue
+		}
+		content, ok := contentRaw.([]map[string]any)
+		if !ok {
+			continue
+		}
+		for _, part := range content {
+			partType, _ := part["type"].(string)
+			switch partType {
+			case "input_text":
+				stats.InputTextParts++
+			case "input_image":
+				stats.InputImageParts++
+			}
+		}
+	}
+	return stats
 }
 
 // handleConcurrencyError handles concurrency-related errors with proper 429 response

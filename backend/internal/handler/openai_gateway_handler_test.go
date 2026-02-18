@@ -180,3 +180,83 @@ func TestNormalizeChatCompletionsRequest_ConvertsImageURLString(t *testing.T) {
 		t.Fatalf("unexpected image content part: %+v", content[0])
 	}
 }
+
+func TestCollectRawChatContentStats(t *testing.T) {
+	messages := []any{
+		map[string]any{
+			"role": "user",
+			"content": []any{
+				map[string]any{"type": "text", "text": "hello"},
+				map[string]any{"type": "image_url", "image_url": "https://example.com/a.png"},
+				map[string]any{"type": "image_url", "image_url": map[string]any{"url": ""}},
+				map[string]any{"type": "input_image", "file_id": "file_123"},
+				map[string]any{"type": "input_image"},
+				map[string]any{"type": "video_url", "video_url": "https://example.com/v.mp4"},
+				42,
+			},
+		},
+		map[string]any{
+			"role":    "user",
+			"content": "plain text",
+		},
+		map[string]any{
+			"role":    "user",
+			"content": 123,
+		},
+	}
+
+	stats := collectRawChatContentStats(messages)
+	if stats.RawMessages != 3 {
+		t.Fatalf("expected 3 messages, got %d", stats.RawMessages)
+	}
+	if stats.RawImageParts != 4 {
+		t.Fatalf("expected 4 raw image parts, got %d", stats.RawImageParts)
+	}
+	if stats.RawInvalidImageParts != 2 {
+		t.Fatalf("expected 2 invalid image parts, got %d", stats.RawInvalidImageParts)
+	}
+	if stats.RawUnknownParts != 3 {
+		t.Fatalf("expected 3 unknown parts, got %d", stats.RawUnknownParts)
+	}
+	if stats.unknownTypes["video_url"] != 1 {
+		t.Fatalf("expected video_url unknown count=1, got %+v", stats.unknownTypes)
+	}
+	if stats.unknownTypes["non_object"] != 1 {
+		t.Fatalf("expected non_object unknown count=1, got %+v", stats.unknownTypes)
+	}
+	if stats.unknownTypes["non_array_content"] != 1 {
+		t.Fatalf("expected non_array_content unknown count=1, got %+v", stats.unknownTypes)
+	}
+}
+
+func TestCollectNormalizedChatInputStats(t *testing.T) {
+	input := []any{
+		map[string]any{
+			"type": "message",
+			"content": []map[string]any{
+				{"type": "input_text", "text": "hello"},
+				{"type": "input_image", "image_url": "https://example.com/a.png"},
+			},
+		},
+		map[string]any{
+			"type": "function_call",
+		},
+		map[string]any{
+			"type": "message",
+			"content": []map[string]any{
+				{"type": "input_image", "file_id": "file_456"},
+			},
+		},
+	}
+
+	stats := collectNormalizedChatInputStats(input)
+	if stats.InputItems != 3 {
+		t.Fatalf("expected 3 input items, got %d", stats.InputItems)
+	}
+	if stats.InputTextParts != 1 {
+		t.Fatalf("expected 1 input_text part, got %d", stats.InputTextParts)
+	}
+	if stats.InputImageParts != 2 {
+		t.Fatalf("expected 2 input_image parts, got %d", stats.InputImageParts)
+	}
+}

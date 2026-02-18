@@ -879,6 +879,16 @@ func (s *OpenAIGatewayService) Forward(ctx context.Context, c *gin.Context, acco
 			return nil, fmt.Errorf("serialize request body: %w", err)
 		}
 	}
+	if imageParts, textParts, messageItems := countResponsesInputParts(reqBody["input"]); imageParts > 0 {
+		log.Printf("[OpenAI Forward] request contains images: account=%d model=%s input_items=%d message_items=%d input_images=%d input_text=%d",
+			account.ID,
+			reqModel,
+			lenAnySlice(reqBody["input"]),
+			messageItems,
+			imageParts,
+			textParts,
+		)
+	}
 
 	// Get access token
 	token, _, err := s.GetAccessToken(ctx, account)
@@ -2954,4 +2964,43 @@ func normalizeOpenAIReasoningEffort(raw string) string {
 		// Only store known effort levels for now to keep UI consistent.
 		return ""
 	}
+}
+
+func countResponsesInputParts(input any) (imageParts int, textParts int, messageItems int) {
+	items, ok := input.([]any)
+	if !ok {
+		return 0, 0, 0
+	}
+	for _, itemRaw := range items {
+		item, ok := itemRaw.(map[string]any)
+		if !ok {
+			continue
+		}
+		if itemType, _ := item["type"].(string); itemType != "message" {
+			continue
+		}
+		messageItems++
+		content, ok := item["content"].([]map[string]any)
+		if !ok {
+			continue
+		}
+		for _, part := range content {
+			partType, _ := part["type"].(string)
+			switch partType {
+			case "input_image":
+				imageParts++
+			case "input_text":
+				textParts++
+			}
+		}
+	}
+	return imageParts, textParts, messageItems
+}
+
+func lenAnySlice(v any) int {
+	items, ok := v.([]any)
+	if !ok {
+		return 0
+	}
+	return len(items)
 }
