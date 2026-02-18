@@ -1284,8 +1284,6 @@ func (s *OpenAIGatewayService) handleStreamingResponse(ctx context.Context, resp
 
 	chatCompat, _ := c.Get(CtxKeyOpenAIChatCompletionsCompat)
 	isChatCompat, _ := chatCompat.(bool)
-	// Temporary debugging: always log in chat-compat path.
-	debugChatCompat := isChatCompat
 
 	streamInterval := time.Duration(0)
 	if s.cfg != nil && s.cfg.Gateway.StreamDataIntervalTimeout > 0 {
@@ -1360,9 +1358,6 @@ func (s *OpenAIGatewayService) handleStreamingResponse(ctx context.Context, resp
 		select {
 		case ev, ok := <-events:
 			if !ok {
-				if isChatCompat && debugChatCompat {
-					log.Printf("[chat-compat] upstream EOF reached done_sent=%v role_sent=%v", chatDoneSent, chatRoleSent)
-				}
 				if isChatCompat && !chatDoneSent && !clientDisconnected {
 					chatDoneSent = true
 					reason := "stop"
@@ -1407,11 +1402,6 @@ func (s *OpenAIGatewayService) handleStreamingResponse(ctx context.Context, resp
 			// Extract data from SSE line (supports both "data: " and "data:" formats)
 			if openaiSSEDataRe.MatchString(line) {
 				data := openaiSSEDataRe.ReplaceAllString(line, "")
-				if isChatCompat && debugChatCompat {
-					eventType := extractResponsesEventType(data)
-					log.Printf("[chat-compat] upstream event=%s bytes=%d payload=%s",
-						eventType, len(data), chatCompatLogPreview(data, 600))
-				}
 
 				// Replace model in response if needed
 				if needModelReplace {
@@ -1428,13 +1418,7 @@ func (s *OpenAIGatewayService) handleStreamingResponse(ctx context.Context, resp
 				if !clientDisconnected {
 					if isChatCompat {
 						chunks, done := convertResponsesSSEToChatChunks(data, originalModel, chatChunkID, chatCreated, &chatRoleSent, chatToolState)
-						if debugChatCompat {
-							log.Printf("[chat-compat] mapped chunks=%d done=%v", len(chunks), done)
-						}
 						for _, chunk := range chunks {
-							if debugChatCompat {
-								log.Printf("[chat-compat] out chunk=%s", chatCompatLogPreview(chunk, 600))
-							}
 							if _, err := fmt.Fprintf(w, "data: %s\n\n", chunk); err != nil {
 								clientDisconnected = true
 								log.Printf("Client disconnected during streaming, continuing to drain upstream for billing")
@@ -1830,27 +1814,6 @@ func intPtrFromAny(v any) *int {
 	default:
 		return nil
 	}
-}
-
-func chatCompatLogPreview(s string, max int) string {
-	if max <= 0 {
-		max = 512
-	}
-	if len(s) <= max {
-		return s
-	}
-	return s[:max] + "...(truncated)"
-}
-
-func extractResponsesEventType(raw string) string {
-	var payload map[string]any
-	if err := json.Unmarshal([]byte(raw), &payload); err != nil {
-		return ""
-	}
-	if t, _ := payload["type"].(string); t != "" {
-		return t
-	}
-	return ""
 }
 
 func convertResponsesSSEToChatChunks(data, model, id string, created int64, roleSent *bool, toolState *chatToolCallState) ([]string, bool) {
