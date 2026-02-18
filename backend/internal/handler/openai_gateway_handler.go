@@ -336,16 +336,24 @@ func (h *OpenAIGatewayHandler) Responses(c *gin.Context) {
 func (h *OpenAIGatewayHandler) ChatCompletions(c *gin.Context) {
 	body, err := io.ReadAll(c.Request.Body)
 	if err != nil {
+		if maxErr, ok := extractMaxBytesError(err); ok {
+			log.Printf("[OpenAI ChatCompat] request body too large: path=%s limit=%d ua=%q", c.Request.URL.Path, maxErr.Limit, c.GetHeader("User-Agent"))
+			h.errorResponse(c, http.StatusRequestEntityTooLarge, "invalid_request_error", buildBodyTooLargeMessage(maxErr.Limit))
+			return
+		}
+		log.Printf("[OpenAI ChatCompat] read request body failed: path=%s err=%v ua=%q", c.Request.URL.Path, err, c.GetHeader("User-Agent"))
 		h.errorResponse(c, http.StatusBadRequest, "invalid_request_error", "Failed to read request body")
 		return
 	}
 	if len(body) == 0 {
+		log.Printf("[OpenAI ChatCompat] empty request body: path=%s content_type=%q ua=%q", c.Request.URL.Path, c.GetHeader("Content-Type"), c.GetHeader("User-Agent"))
 		h.errorResponse(c, http.StatusBadRequest, "invalid_request_error", "Request body is empty")
 		return
 	}
 
 	var reqBody map[string]any
 	if err := json.Unmarshal(body, &reqBody); err != nil {
+		log.Printf("[OpenAI ChatCompat] parse request body failed: path=%s err=%v content_type=%q ua=%q", c.Request.URL.Path, err, c.GetHeader("Content-Type"), c.GetHeader("User-Agent"))
 		h.errorResponse(c, http.StatusBadRequest, "invalid_request_error", "Failed to parse request body")
 		return
 	}

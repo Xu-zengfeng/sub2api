@@ -2980,11 +2980,11 @@ func countResponsesInputParts(input any) (imageParts int, textParts int, message
 			continue
 		}
 		messageItems++
-		content, ok := item["content"].([]map[string]any)
-		if !ok {
+		parts := normalizeContentParts(item["content"])
+		if len(parts) == 0 {
 			continue
 		}
-		for _, part := range content {
+		for _, part := range parts {
 			partType, _ := part["type"].(string)
 			switch partType {
 			case "input_image":
@@ -2995,6 +2995,25 @@ func countResponsesInputParts(input any) (imageParts int, textParts int, message
 		}
 	}
 	return imageParts, textParts, messageItems
+}
+
+func normalizeContentParts(raw any) []map[string]any {
+	switch v := raw.(type) {
+	case []map[string]any:
+		return v
+	case []any:
+		parts := make([]map[string]any, 0, len(v))
+		for _, item := range v {
+			part, ok := item.(map[string]any)
+			if !ok {
+				continue
+			}
+			parts = append(parts, part)
+		}
+		return parts
+	default:
+		return nil
+	}
 }
 
 func lenAnySlice(v any) int {
