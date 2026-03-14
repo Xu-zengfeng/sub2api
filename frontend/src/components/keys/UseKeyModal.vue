@@ -493,7 +493,7 @@ function generateOpenAIFiles(baseUrl: string, apiKey: string): FileConfig[] {
 
   // config.toml content
   const configContent = `model_provider = "sub2api"
-model = "gpt-5.3-codex"
+model = "gpt-5.4"
 model_reasoning_effort = "high"
 network_access = "enabled"
 disable_response_storage = true
@@ -534,8 +534,8 @@ function generateOpenCodeConfig(platform: string, baseUrl: string, apiKey: strin
     }
   }
   const openaiModels = {
-    'gpt-5.2-codex': {
-      name: 'GPT-5.2 Codex',
+    'gpt-5.4': {
+      name: 'GPT-5.4',
       options: {
         store: false
       },
